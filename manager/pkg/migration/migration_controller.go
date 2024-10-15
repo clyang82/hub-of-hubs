@@ -262,7 +262,7 @@ func (m *MigrationReconciler) generateKubeconfig(ctx context.Context, req ctrl.R
 		Token: string(desiredSecret.Data["token"]),
 	}
 	config.Contexts["default-context"] = &clientcmdapi.Context{
-		Cluster:  req.Namespace,
+		Cluster:  "a8e97064-77c0-43a1-aaa6-5fde67d28503",
 		AuthInfo: "user",
 	}
 	config.CurrentContext = "default-context"

@@ -140,9 +140,11 @@ func (s *managedClusterMigrationFromSyncer) Sync(ctx context.Context, payload []
 		}
 
 		_, migrating := annotations[constants.ManagedClusterMigrating]
-		if migrating && annotations["agent.open-cluster-management.io/klusterlet-config"] == klusterletConfig.Name {
+		_, disableAutoImport := annotations["import.open-cluster-management.io/disable-auto-import"]
+		if migrating && disableAutoImport && annotations["agent.open-cluster-management.io/klusterlet-config"] == klusterletConfig.Name {
 			continue
 		}
+		annotations["import.open-cluster-management.io/disable-auto-import"] = ""
 		annotations["agent.open-cluster-management.io/klusterlet-config"] = klusterletConfig.Name
 		annotations[constants.ManagedClusterMigrating] = ""
 		mcl.SetAnnotations(annotations)
