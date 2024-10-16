@@ -26,6 +26,7 @@ import (
 	"github.com/stolostron/multicluster-global-hub/pkg/utils"
 )
 
+// go test ./test/integration/manager/controller -v -ginkgo.focus "migration"
 var _ = Describe("migration", Ordered, func() {
 	Context("managed cluster migration tests with from hub", func() {
 		var migrationInstance *migrationv1alpha1.ManagedClusterMigration
@@ -82,6 +83,68 @@ var _ = Describe("migration", Ordered, func() {
 			By("create hub2 namespace")
 			hub2Namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "hub2"}}
 			Expect(mgr.GetClient().Create(testCtx, hub2Namespace)).Should(Succeed())
+			By("create hub1 namespace")
+			hub1Namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "hub1"}}
+			Expect(mgr.GetClient().Create(testCtx, hub1Namespace)).Should(Succeed())
+
+			// create a managedcluster
+			By("create hub2 managedcluster")
+			mc2 := &clusterv1.ManagedCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "hub2",
+				},
+				Spec: clusterv1.ManagedClusterSpec{
+					ManagedClusterClientConfigs: []clusterv1.ClientConfig{
+						{
+							URL:      "https://example.com",
+							CABundle: []byte("test"),
+						},
+					},
+				},
+			}
+			Expect(mgr.GetClient().Create(testCtx, mc2)).To(Succeed())
+			By("create hub1 managedcluster")
+			mc1 := &clusterv1.ManagedCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "hub1",
+				},
+				Spec: clusterv1.ManagedClusterSpec{
+					ManagedClusterClientConfigs: []clusterv1.ClientConfig{
+						{
+							URL:      "https://example.com",
+							CABundle: []byte("test"),
+						},
+					},
+				},
+			}
+			Expect(mgr.GetClient().Create(testCtx, mc1)).To(Succeed())
+
+			// mimic msa generated secret
+			By("mimic msa generated secret")
+			hub2Secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "migration",
+					Namespace: "hub2",
+				},
+				Data: map[string][]byte{
+					"ca.crt": []byte("test"),
+					"token":  []byte("test"),
+				},
+			}
+			Expect(mgr.GetClient().Create(testCtx, hub2Secret)).To(Succeed())
+
+			By("mimic msa generated secret")
+			hub1Secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "migration",
+					Namespace: "hub1",
+				},
+				Data: map[string][]byte{
+					"ca.crt": []byte("test"),
+					"token":  []byte("test"),
+				},
+			}
+			Expect(mgr.GetClient().Create(testCtx, hub1Secret)).To(Succeed())
 
 			// create managedclustermigration CR
 			By("create managedclustermigration CR")
@@ -98,54 +161,36 @@ var _ = Describe("migration", Ordered, func() {
 			}
 			Expect(mgr.GetClient().Create(testCtx, migrationInstance)).To(Succeed())
 
-			// create a managedcluster
-			By("create a managedcluster")
-			mc := &clusterv1.ManagedCluster{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "hub2",
-				},
-				Spec: clusterv1.ManagedClusterSpec{
-					ManagedClusterClientConfigs: []clusterv1.ClientConfig{
-						{
-							URL:      "https://example.com",
-							CABundle: []byte("test"),
-						},
-					},
-				},
-			}
-			Expect(mgr.GetClient().Create(testCtx, mc)).To(Succeed())
-
-			// mimic msa generated secret
-			By("mimic msa generated secret")
-			secret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "migration",
-					Namespace: "hub2",
-				},
-				Data: map[string][]byte{
-					"ca.crt": []byte("test"),
-					"token":  []byte("test"),
-				},
-			}
-			Expect(mgr.GetClient().Create(testCtx, secret)).To(Succeed())
 		})
 
 		AfterAll(func() {
 			By("delete hub2 namespace")
 			hub2Namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "hub2"}}
 			Expect(mgr.GetClient().Delete(testCtx, hub2Namespace)).Should(Succeed())
+			By("delete hub1 namespace")
+			hub1Namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "hub1"}}
+			Expect(mgr.GetClient().Delete(testCtx, hub1Namespace)).Should(Succeed())
 
 			By("cancel the test context")
 			testCtxCancel()
 		})
 
-		It("should have managedserviceaccount created", func() {
+		It("should have managedserviceaccount created in hub2 namespace", func() {
 			Eventually(func() error {
 				return mgr.GetClient().Get(testCtx, types.NamespacedName{
 					Name:      "migration",
 					Namespace: "hub2",
 				}, &v1beta1.ManagedServiceAccount{})
-			}, 3*time.Second, 100*time.Millisecond).Should(Succeed())
+			}, 1*time.Second, 100*time.Millisecond).Should(Succeed())
+		})
+
+		It("should have managedserviceaccount created in hub1 namespace", func() {
+			Eventually(func() error {
+				return mgr.GetClient().Get(testCtx, types.NamespacedName{
+					Name:      "migration",
+					Namespace: "hub1",
+				}, &v1beta1.ManagedServiceAccount{})
+			}, 1*time.Second, 100*time.Millisecond).Should(Succeed())
 		})
 
 		It("should have bootstrap secret generated after managedserviceaccount is reconciled", func() {
@@ -160,10 +205,40 @@ var _ = Describe("migration", Ordered, func() {
 			Expect(mgr.GetClient().Update(testCtx, msa)).To(Succeed())
 
 			Eventually(func() error {
-				if migrationReconciler.BootstrapSecret == nil {
+				event := migrationReconciler.Migrations["migration"]["hub1"]
+				if event.BootstrapSecret == nil {
 					return fmt.Errorf("bootstrap secret is nil")
 				}
-				kubeconfigBytes := migrationReconciler.BootstrapSecret.Data["kubeconfig"]
+				kubeconfigBytes := event.BootstrapSecret.Data["kubeconfig"]
+				if string(kubeconfigBytes) == "" {
+					return fmt.Errorf("failed to generate kubeconfig")
+				}
+
+				_, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigBytes)
+				if err != nil {
+					return fmt.Errorf("failed to create Kubernetes client config: %v", err)
+				}
+				return nil
+			}, 3*time.Second, 100*time.Millisecond).Should(Succeed())
+		})
+
+		It("should have the original bootstrap secret generated after managedserviceaccount is reconciled", func() {
+			msa := &v1beta1.ManagedServiceAccount{}
+			Expect(mgr.GetClient().Get(testCtx, types.NamespacedName{
+				Name:      "migration",
+				Namespace: "hub1",
+			}, msa)).To(Succeed())
+
+			// mimic the managedserviceaccount is reconciled
+			msa.Spec.Rotation.Validity = metav1.Duration{Duration: 3600 * time.Hour}
+			Expect(mgr.GetClient().Update(testCtx, msa)).To(Succeed())
+
+			Eventually(func() error {
+				event := migrationReconciler.Migrations["migration"]["hub1"]
+				if event.OriginalBootstrapSecret == nil {
+					return fmt.Errorf("the original bootstrap secret is nil")
+				}
+				kubeconfigBytes := event.OriginalBootstrapSecret.Data["kubeconfig"]
 				if string(kubeconfigBytes) == "" {
 					return fmt.Errorf("failed to generate kubeconfig")
 				}
@@ -253,11 +328,14 @@ var _ = Describe("migration", Ordered, func() {
 				if klusterletConfig.Spec.BootstrapKubeConfigs.Type != operatorv1.LocalSecrets {
 					return fmt.Errorf("klusterletConfig bootstrap kubeconfig type is not correct")
 				}
-				if len(klusterletConfig.Spec.BootstrapKubeConfigs.LocalSecrets.KubeConfigSecrets) != 1 {
+				if len(klusterletConfig.Spec.BootstrapKubeConfigs.LocalSecrets.KubeConfigSecrets) != 2 {
 					return fmt.Errorf("klusterletConfig bootstrap kubeconfig secrets is not correct")
 				}
 				if klusterletConfig.Spec.BootstrapKubeConfigs.LocalSecrets.KubeConfigSecrets[0].Name != "bootstrap-hub2" {
 					return fmt.Errorf("klusterletConfig bootstrap kubeconfig secret name 0 is not correct")
+				}
+				if klusterletConfig.Spec.BootstrapKubeConfigs.LocalSecrets.KubeConfigSecrets[1].Name != "bootstrap-hub1" {
+					return fmt.Errorf("klusterletConfig bootstrap kubeconfig secret name 1 is not correct")
 				}
 
 				managedClusterMigrationToEvent := &bundleevent.ManagedClusterMigrationToEvent{}
@@ -445,10 +523,11 @@ var _ = Describe("migration", Ordered, func() {
 			Expect(mgr.GetClient().Update(testCtx, msa)).To(Succeed())
 
 			Eventually(func() error {
-				if migrationReconciler.BootstrapSecret == nil {
+				event := migrationReconciler.Migrations["migration"]["hub2"]
+				if event.BootstrapSecret == nil {
 					return fmt.Errorf("bootstrap secret is nil")
 				}
-				kubeconfigBytes := migrationReconciler.BootstrapSecret.Data["kubeconfig"]
+				kubeconfigBytes := event.BootstrapSecret.Data["kubeconfig"]
 				if string(kubeconfigBytes) == "" {
 					return fmt.Errorf("failed to generate kubeconfig")
 				}

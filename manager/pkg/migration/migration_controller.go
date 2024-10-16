@@ -42,7 +42,7 @@ import (
 type MigrationReconciler struct {
 	client.Client
 	transport.Producer
-	BootstrapSecret       *corev1.Secret
+	Migrations            map[string]map[string](bundleevent.ManagedClusterMigrationFromEvent)
 	importClusterInHosted bool
 }
 
@@ -53,6 +53,7 @@ func NewMigrationReconciler(client client.Client, producer transport.Producer,
 		Client:                client,
 		Producer:              producer,
 		importClusterInHosted: importClusterInHosted,
+		Migrations:            map[string]map[string](bundleevent.ManagedClusterMigrationFromEvent){},
 	}
 }
 
@@ -142,7 +143,7 @@ func (m *MigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		} else {
 			// The migration object is being deleted
 			if controllerutil.ContainsFinalizer(migration, constants.ManagedClusterMigrationFinalizer) {
-				if err := m.deleteManagedServiceAccount(ctx, migration); err != nil {
+				if err := m.deleteManagedServiceAccount(ctx, migration); err != nil { // TODO: delete all msa
 					return ctrl.Result{}, err
 				}
 
@@ -151,13 +152,44 @@ func (m *MigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					return ctrl.Result{}, err
 				}
 			}
+			delete(m.Migrations, migration.Name)
 			return ctrl.Result{}, nil
 		}
+		// should be handled in server foundation. provide the default kubeconfig for the exixting hub
+		managedClusterMap, err := m.fillInManagedClusterMap(migration)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		for leafHubName := range managedClusterMap {
+			if err := m.ensureManagedServiceAccount(ctx, migration.GetName(), leafHubName); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 
-		if err := m.ensureManagedServiceAccount(ctx, migration); err != nil {
+		if err := m.ensureManagedServiceAccount(ctx, migration.GetName(), migration.Spec.To); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else {
+		migration := &migrationv1alpha1.ManagedClusterMigration{}
+		if err := m.Get(ctx, types.NamespacedName{
+			Name:      req.Name,
+			Namespace: utils.GetDefaultNamespace(),
+		}, migration); err != nil {
+			log.Error(err, "failed to get managedclustermigration")
+			return ctrl.Result{}, err
+		}
+		if _, exists := m.Migrations[migration.Name]; !exists {
+			m.Migrations[migration.Name] = map[string](bundleevent.ManagedClusterMigrationFromEvent){}
+			managedClusterMap, err := m.fillInManagedClusterMap(migration)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			for leafHubName, managedClusters := range managedClusterMap {
+				m.Migrations[migration.Name][leafHubName] = bundleevent.ManagedClusterMigrationFromEvent{
+					ManagedClusters: managedClusters,
+				}
+			}
+		}
 		// check if the secret is created by managedserviceaccount, if not, requeue after 1 second
 		desiredSecret := &corev1.Secret{}
 		if err := m.Client.Get(ctx, types.NamespacedName{
@@ -175,32 +207,41 @@ func (m *MigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		m.BootstrapSecret, err = m.generateBootstrapSecret(kubeconfig, req)
+
+		bootstrapSecret, err := m.generateBootstrapSecret(kubeconfig, req)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		// generate klusterletconfig
-		klusterletConfig := m.generateKlusterConfig(req)
-		// send the kubeconfig to managedclustermigration.Spec.From
-		migration := &migrationv1alpha1.ManagedClusterMigration{}
-		if err = m.Get(ctx, types.NamespacedName{
-			Name:      req.Name,
-			Namespace: utils.GetDefaultNamespace(),
-		}, migration); err != nil {
-			log.Error(err, "failed to get managedclustermigration")
-			return ctrl.Result{}, err
+
+		if req.Namespace == migration.Spec.To {
+			for key := range m.Migrations[migration.Name] {
+				evt := m.Migrations[migration.Name][key]
+				evt.BootstrapSecret = bootstrapSecret
+				m.Migrations[migration.Name][key] = evt
+			}
+		} else {
+			evt := m.Migrations[migration.Name][req.Namespace]
+			evt.OriginalBootstrapSecret = bootstrapSecret
+			m.Migrations[migration.Name][req.Namespace] = evt
 		}
-		if err := m.syncMigration(ctx, migration, klusterletConfig); err != nil {
-			return ctrl.Result{}, err
+		for _, evt := range m.Migrations[migration.Name] {
+			if evt.BootstrapSecret != nil && evt.OriginalBootstrapSecret != nil {
+				evt.KlusterletConfig = m.generateKlusterConfig(migration, evt)
+				// send the kubeconfig to managedclustermigration.Spec.From
+				if err := m.syncMigration(ctx, migration, evt); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
 		}
 	}
 	return ctrl.Result{}, nil
 }
 
-func (m *MigrationReconciler) generateKlusterConfig(req ctrl.Request) *klusterletv1alpha1.KlusterletConfig {
+func (m *MigrationReconciler) generateKlusterConfig(migration *migrationv1alpha1.ManagedClusterMigration,
+	event bundleevent.ManagedClusterMigrationFromEvent) *klusterletv1alpha1.KlusterletConfig {
 	return &klusterletv1alpha1.KlusterletConfig{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: klusterletConfigNamePrefix + req.Namespace,
+			Name: klusterletConfigNamePrefix + migration.Spec.To,
 		},
 		Spec: klusterletv1alpha1.KlusterletConfigSpec{
 			BootstrapKubeConfigs: operatorv1.BootstrapKubeConfigs{
@@ -208,7 +249,10 @@ func (m *MigrationReconciler) generateKlusterConfig(req ctrl.Request) *klusterle
 				LocalSecrets: operatorv1.LocalSecretsConfig{
 					KubeConfigSecrets: []operatorv1.KubeConfigSecret{
 						{
-							Name: bootstrapSecretNamePrefix + req.Namespace,
+							Name: event.BootstrapSecret.Name,
+						},
+						{
+							Name: event.OriginalBootstrapSecret.Name,
 						},
 					},
 				},
@@ -262,7 +306,7 @@ func (m *MigrationReconciler) generateKubeconfig(ctx context.Context, req ctrl.R
 		Token: string(desiredSecret.Data["token"]),
 	}
 	config.Contexts["default-context"] = &clientcmdapi.Context{
-		Cluster:  "a8e97064-77c0-43a1-aaa6-5fde67d28503",
+		Cluster:  req.Namespace,
 		AuthInfo: "user",
 	}
 	config.CurrentContext = "default-context"
@@ -271,13 +315,13 @@ func (m *MigrationReconciler) generateKubeconfig(ctx context.Context, req ctrl.R
 }
 
 func (m *MigrationReconciler) ensureManagedServiceAccount(ctx context.Context,
-	migration *migrationv1alpha1.ManagedClusterMigration,
+	msaName, msaNamespace string,
 ) error {
 	// create a desired msa
 	desiredMSA := &v1beta1.ManagedServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      migration.GetName(),
-			Namespace: migration.Spec.To,
+			Name:      msaName,
+			Namespace: msaNamespace,
 			Labels: map[string]string{
 				"owner": strings.ToLower(constants.ManagedClusterMigrationKind),
 			},
@@ -294,8 +338,8 @@ func (m *MigrationReconciler) ensureManagedServiceAccount(ctx context.Context,
 
 	existingMSA := &v1beta1.ManagedServiceAccount{}
 	err := m.Client.Get(ctx, types.NamespacedName{
-		Name:      migration.GetName(),
-		Namespace: migration.Spec.To,
+		Name:      msaName,
+		Namespace: msaNamespace,
 	}, existingMSA)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -309,52 +353,73 @@ func (m *MigrationReconciler) ensureManagedServiceAccount(ctx context.Context,
 func (m *MigrationReconciler) deleteManagedServiceAccount(ctx context.Context,
 	migration *migrationv1alpha1.ManagedClusterMigration,
 ) error {
+	// enhance to continue deleting others if one is failed
+	for key := range m.Migrations[migration.Name] {
+		msa := &v1beta1.ManagedServiceAccount{}
+		if err := m.Get(ctx, types.NamespacedName{
+			Name:      migration.Name,
+			Namespace: key,
+		}, msa); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+		if err := m.Delete(ctx, msa); err != nil {
+			return err
+		}
+	}
+
+	// delete To managedserviceaccount
 	msa := &v1beta1.ManagedServiceAccount{}
 	if err := m.Get(ctx, types.NamespacedName{
 		Name:      migration.Name,
 		Namespace: migration.Spec.To,
 	}, msa); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
+		if !apierrors.IsNotFound(err) {
+			return err
 		}
-		return err
 	}
 	return m.Delete(ctx, msa)
 }
 
+func (m *MigrationReconciler) fillInManagedClusterMap(migration *migrationv1alpha1.ManagedClusterMigration) (
+	map[string][]string, error) {
+	managedClusterMap := make(map[string][]string)
+	if migration.Spec.From != "" {
+		managedClusterMap[migration.Spec.From] = migration.Spec.IncludedManagedClusters
+		return managedClusterMap, nil
+	}
+
+	db := database.GetGorm()
+	rows, err := db.Raw(`SELECT leaf_hub_name, cluster_name FROM status.managed_clusters
+			WHERE cluster_name IN (?)`,
+		migration.Spec.IncludedManagedClusters).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get leaf hub name and managed clusters - %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var leafHubName, managedClusterName string
+		if err := rows.Scan(&leafHubName, &managedClusterName); err != nil {
+			return nil, fmt.Errorf("failed to scan leaf hub name and managed cluster name - %w", err)
+		}
+		managedClusterMap[leafHubName] = append(managedClusterMap[leafHubName], managedClusterName)
+	}
+	return managedClusterMap, nil
+}
+
 func (m *MigrationReconciler) syncMigration(ctx context.Context,
 	migration *migrationv1alpha1.ManagedClusterMigration,
-	klusterletConfig *klusterletv1alpha1.KlusterletConfig,
+	event bundleevent.ManagedClusterMigrationFromEvent,
 ) error {
-	if migration.Spec.From != "" {
-		// send the migration event to migration.from managed hub
-		if err := m.syncMigrationFrom(ctx, migration.Spec.From,
-			migration.Spec.IncludedManagedClusters, klusterletConfig); err != nil {
+	managedClusterMap, err := m.fillInManagedClusterMap(migration)
+	if err != nil {
+		return err
+	}
+	// send the migration event to migration.from managed hub(s)
+	for leafHubName := range managedClusterMap {
+		if err := m.syncMigrationFrom(ctx, leafHubName, event); err != nil {
 			return err
-		}
-	} else {
-		db := database.GetGorm()
-		managedClusterMap := make(map[string][]string)
-		rows, err := db.Raw(`SELECT leaf_hub_name, cluster_name FROM status.managed_clusters
-			WHERE cluster_name IN (?)`,
-			migration.Spec.IncludedManagedClusters).Rows()
-		if err != nil {
-			return fmt.Errorf("failed to get leaf hub name and managed clusters - %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var leafHubName, managedClusterName string
-			if err := rows.Scan(&leafHubName, &managedClusterName); err != nil {
-				return fmt.Errorf("failed to scan leaf hub name and managed cluster name - %w", err)
-			}
-			managedClusterMap[leafHubName] = append(managedClusterMap[leafHubName], managedClusterName)
-		}
-
-		// send the migration event to migration.from managed hub(s)
-		for leafHubName, managedClusters := range managedClusterMap {
-			if err := m.syncMigrationFrom(ctx, leafHubName, managedClusters, klusterletConfig); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -362,16 +427,9 @@ func (m *MigrationReconciler) syncMigration(ctx context.Context,
 	return m.syncMigrationTo(ctx, migration)
 }
 
-func (m *MigrationReconciler) syncMigrationFrom(ctx context.Context,
-	fromHub string, managedClusters []string,
-	klusterletConfig *klusterletv1alpha1.KlusterletConfig,
+func (m *MigrationReconciler) syncMigrationFrom(ctx context.Context, fromHub string,
+	managedClusterMigrationFromEvent bundleevent.ManagedClusterMigrationFromEvent,
 ) error {
-	managedClusterMigrationFromEvent := &bundleevent.ManagedClusterMigrationFromEvent{
-		ManagedClusters:  managedClusters,
-		BootstrapSecret:  m.BootstrapSecret,
-		KlusterletConfig: klusterletConfig,
-	}
-
 	payloadBytes, err := json.Marshal(managedClusterMigrationFromEvent)
 	if err != nil {
 		return fmt.Errorf("failed to marshal managed cluster migration from event(%v) - %w",

@@ -6,9 +6,10 @@ import (
 )
 
 type ManagedClusterMigrationFromEvent struct {
-	ManagedClusters  []string                             `json:"managedClusters"`
-	BootstrapSecret  *corev1.Secret                       `json:"bootstrapSecret"`
-	KlusterletConfig *klusterletv1alpha1.KlusterletConfig `json:"klusterletConfig"`
+	ManagedClusters         []string                             `json:"managedClusters"`
+	BootstrapSecret         *corev1.Secret                       `json:"bootstrapSecret"`
+	OriginalBootstrapSecret *corev1.Secret                       `json:"originalBootstrapSecret"`
+	KlusterletConfig        *klusterletv1alpha1.KlusterletConfig `json:"klusterletConfig"`
 }
 
 type ManagedClusterMigrationToEvent struct {
